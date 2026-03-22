@@ -1,0 +1,561 @@
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime
+from typing import Any
+
+import pandas as pd
+import streamlit as st
+
+
+def _streamlit_secrets_into_environ() -> None:
+    try:
+        secrets = st.secrets
+    except (RuntimeError, FileNotFoundError, TypeError):
+        return
+
+    service_account_secret = secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if service_account_secret and not os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+        if hasattr(service_account_secret, "to_dict"):
+            os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = json.dumps(
+                service_account_secret.to_dict(),
+                ensure_ascii=False,
+            )
+        elif isinstance(service_account_secret, dict):
+            os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = json.dumps(
+                service_account_secret,
+                ensure_ascii=False,
+            )
+        else:
+            os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"] = str(service_account_secret)
+
+    for key in (
+        "GEMINI_AI_STUDIO_API_KEY",
+        "GOOGLE_API_KEY",
+        "SPREADSHEET_URL",
+        "APP_TIMEZONE",
+        "GEMINI_MODEL_CANDIDATES",
+    ):
+        if key in secrets and not os.environ.get(key):
+            os.environ[key] = str(secrets[key])
+
+
+_streamlit_secrets_into_environ()
+
+from muscle_training_app.domain import (
+    LOG_HEADERS,
+    MODEL_THINKING_LEVELS,
+    RPE_OPTIONS,
+    build_session_volume_rows,
+    format_number,
+    format_rpe,
+    json_dumps,
+    next_set_number,
+    normalize_log_record,
+    normalize_text,
+    parse_date,
+    summarize_recent_progress,
+    summarize_today_logs,
+)
+from muscle_training_app.gemini_client import GeminiAPIError, GeminiClient
+from muscle_training_app.settings import AppSettings, load_settings
+from muscle_training_app.sheets_repo import GoogleSheetsRepository
+
+st.set_page_config(page_title="筋トレログアプリ", page_icon="🏋️", layout="wide")
+
+
+@st.cache_resource(show_spinner=False)
+def get_settings() -> AppSettings:
+    return load_settings()
+
+
+@st.cache_resource(show_spinner=False)
+def get_repository() -> GoogleSheetsRepository:
+    settings = get_settings()
+    repository = GoogleSheetsRepository(
+        spreadsheet_url=settings.spreadsheet_url,
+        service_account_json_path=(
+            str(settings.service_account_json_path)
+            if settings.service_account_json_path
+            else None
+        ),
+        service_account_info=settings.service_account_info,
+    )
+    repository.ensure_schema()
+    return repository
+
+
+@st.cache_resource(show_spinner=False)
+def get_gemini_client() -> GeminiClient:
+    settings = get_settings()
+    return GeminiClient(
+        api_keys=settings.api_keys,
+        model_candidates=settings.model_candidates,
+    )
+
+
+def current_time() -> datetime:
+    return datetime.now(get_settings().timezone)
+
+
+def available_exercises() -> list[str]:
+    repository = get_repository()
+    names = repository.list_exercises(active_only=True)
+    return names
+
+
+def logs_to_dataframe(logs: list[dict[str, Any]]) -> pd.DataFrame:
+    if not logs:
+        return pd.DataFrame(columns=LOG_HEADERS)
+    frame = pd.DataFrame(logs)
+    columns = ["日付", "種目", "セット番号", "重さ_kg", "回数", "RPE", "休憩秒", "ボリューム_kg", "ノート", "作成日時"]
+    for column in columns:
+        if column not in frame.columns:
+            frame[column] = ""
+    return frame[columns]
+
+
+def editable_logs_to_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for row in frame.to_dict(orient="records"):
+        normalized = normalize_log_record(row)
+        if not normalized["exercise"] or normalized["weight_kg"] < 0 or normalized["reps"] <= 0:
+            continue
+        records.append(normalized)
+    return records
+
+
+def ensure_session_state() -> None:
+    st.session_state.setdefault("app_opened_at", current_time().isoformat(timespec="seconds"))
+    st.session_state.setdefault("parsed_log_records", [])
+    st.session_state.setdefault("parsed_new_exercises", [])
+    st.session_state.setdefault("last_advice", None)
+
+
+def render_sidebar() -> tuple[str, str]:
+    settings = get_settings()
+    repository = get_repository()
+    meta = repository.get_meta()
+    st.sidebar.caption("接続先")
+    st.sidebar.write(meta.title)
+    st.sidebar.caption("セッション開始")
+    st.sidebar.write(st.session_state["app_opened_at"])
+    selected_model = st.sidebar.selectbox(
+        "Gemini モデル",
+        options=list(settings.model_candidates),
+    )
+    model_thinking_levels = getattr(settings, "model_thinking_levels", None) or {
+        model: tuple(levels) for model, levels in MODEL_THINKING_LEVELS.items()
+    }
+    thinking_levels = list(model_thinking_levels.get(selected_model, ("low",)))
+    selected_thinking_level = st.sidebar.selectbox(
+        "Thinking level",
+        options=thinking_levels,
+        index=0,
+        help="Gemini 3 系の thinking level を指定します。",
+    )
+    st.sidebar.caption("ワークシート")
+    st.sidebar.write(", ".join(meta.worksheet_titles))
+    return selected_model, selected_thinking_level
+
+
+def render_dashboard(logs: list[dict[str, Any]]) -> None:
+    st.subheader("ダッシュボード")
+    today = current_time().date()
+    today_logs = [row for row in logs if row.get("日付") == today.isoformat()]
+    today_volume = sum(float(row.get("ボリューム_kg", 0) or 0) for row in today_logs)
+    two_week_volume = sum(float(row.get("ボリューム_kg", 0) or 0) for row in logs)
+    exercises = sorted({row.get("種目") for row in logs if row.get("種目")})
+
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric("今日の種目数", len({row.get("種目") for row in today_logs if row.get("種目")}))
+    metric2.metric("今日のセット数", len(today_logs))
+    metric3.metric("今日の総ボリューム", f"{format_number(today_volume)} kg")
+    metric4.metric("直近2週間ボリューム", f"{format_number(two_week_volume)} kg")
+
+    left, right = st.columns([1.2, 1])
+    with left:
+        with st.container(border=True):
+            st.caption("今日のメニュー")
+            st.write(summarize_today_logs(logs, today))
+    with right:
+        with st.container(border=True):
+            st.caption("直近2週間の推移要約")
+            st.write(summarize_recent_progress(logs, lookback_days=14))
+
+    st.caption("直近ログ")
+    st.dataframe(logs_to_dataframe(logs[:30]), use_container_width=True, hide_index=True)
+
+    if exercises:
+        selected_exercise = st.selectbox("推移を見る種目", exercises)
+        volume_rows = build_session_volume_rows(logs, selected_exercise)
+        if volume_rows:
+            chart_df = pd.DataFrame(volume_rows)
+            chart_df["日付"] = pd.to_datetime(chart_df["日付"])
+            chart_df = chart_df.set_index("日付")
+            st.line_chart(chart_df[["総ボリューム_kg", "最大重量_kg"]], use_container_width=True)
+
+
+def render_manual_entry(logs: list[dict[str, Any]]) -> None:
+    st.subheader("手入力")
+    repository = get_repository()
+    exercises = available_exercises()
+    default_date = current_time().date()
+    if not exercises:
+        st.warning("種目マスターが空です。先に種目を追加してください。")
+        return
+
+    with st.form("manual_entry_form", clear_on_submit=True):
+        left, right = st.columns(2)
+        with left:
+            selected_date = st.date_input("日付", value=default_date)
+            exercise = st.selectbox("種目", options=exercises)
+            set_number = st.number_input(
+                "セット番号",
+                min_value=1,
+                value=next_set_number(logs, selected_date, exercise),
+                step=1,
+            )
+            weight_kg = st.number_input("重さ(kg)", min_value=0.0, value=40.0, step=2.5)
+        with right:
+            reps = st.number_input("回数", min_value=1, value=5, step=1)
+            rpe = st.selectbox(
+                "RPE",
+                options=RPE_OPTIONS,
+                format_func=format_rpe,
+            )
+            rest_seconds = st.number_input(
+                "休憩秒",
+                min_value=0,
+                value=180,
+                step=15,
+                help="0 の場合は未入力扱いにします。",
+            )
+            note = st.text_input("ノート")
+
+        submitted = st.form_submit_button("このセットを追加", type="primary")
+
+    if submitted:
+        repository.append_log_rows(
+            [
+                {
+                    "date": selected_date.isoformat(),
+                    "exercise": exercise,
+                    "set_number": int(set_number),
+                    "weight_kg": float(weight_kg),
+                    "reps": int(reps),
+                    "rpe": rpe,
+                    "rest_seconds": None if int(rest_seconds) == 0 else int(rest_seconds),
+                    "note": note,
+                }
+            ]
+        )
+        st.success("ログを追加しました。")
+        st.rerun()
+
+    st.divider()
+    st.caption("種目マスター")
+    new_exercise = st.text_input("新しい種目名")
+    add_col, _ = st.columns([1, 3])
+    with add_col:
+        if st.button("種目を追加"):
+            if normalize_text(new_exercise):
+                repository.add_exercise(new_exercise)
+                st.success("種目を追加しました。")
+                st.rerun()
+            else:
+                st.warning("種目名を入力してください。")
+
+    master_rows = repository.load_exercise_records()
+    if master_rows:
+        master_df = pd.DataFrame(master_rows)[["種目名", "有効", "並び順", "作成日時"]]
+        edited_master = st.data_editor(
+            master_df,
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "種目名": st.column_config.TextColumn(required=True),
+                "有効": st.column_config.CheckboxColumn(),
+                "並び順": st.column_config.NumberColumn(min_value=1, step=1),
+                "作成日時": st.column_config.TextColumn(disabled=True),
+            },
+            hide_index=True,
+            key="exercise_master_editor",
+        )
+        if st.button("種目マスターを保存"):
+            repository.save_exercise_records(edited_master.to_dict(orient="records"))
+            st.success("種目マスターを更新しました。")
+            st.rerun()
+
+
+def render_natural_language_entry(selected_model: str, selected_thinking_level: str) -> None:
+    st.subheader("自然言語入力")
+    st.caption("例: 今日ベンチ70kg5回を3セット、RPE8。懸垂10回を2セット。")
+    text = st.text_area(
+        "筋トレ内容",
+        height=140,
+        placeholder="今日ベンチプレス70kg5回を3セット、最後だけRPE9。懸垂は自重で10回を2セット。",
+    )
+
+    if st.button("LLMで解析", type="primary"):
+        if not normalize_text(text):
+            st.warning("筋トレ内容を入力してください。")
+            return
+        try:
+            parsed = get_gemini_client().parse_workout_log(
+                text=text,
+                exercise_names=available_exercises(),
+                now=current_time(),
+                model=selected_model,
+                thinking_level=selected_thinking_level,
+            )
+        except GeminiAPIError as exc:
+            st.error(f"解析に失敗しました: {exc}")
+        else:
+            st.session_state["parsed_log_records"] = parsed["records"]
+            st.session_state["parsed_new_exercises"] = parsed["new_exercises"]
+
+    records = st.session_state.get("parsed_log_records", [])
+    if records:
+        if st.session_state.get("parsed_new_exercises"):
+            st.info(
+                "新規候補種目: " + ", ".join(st.session_state["parsed_new_exercises"])
+            )
+        parsed_df = pd.DataFrame(records).rename(
+            columns={
+                "date": "日付",
+                "exercise": "種目",
+                "set_number": "セット番号",
+                "weight_kg": "重さ_kg",
+                "reps": "回数",
+                "rpe": "RPE",
+                "rest_seconds": "休憩秒",
+                "note": "ノート",
+            }
+        )
+        for column in ("ボリューム_kg", "作成日時"):
+            if column not in parsed_df.columns:
+                parsed_df[column] = ""
+        edited_df = st.data_editor(
+            parsed_df[["日付", "種目", "セット番号", "重さ_kg", "回数", "RPE", "休憩秒", "ノート"]],
+            use_container_width=True,
+            num_rows="dynamic",
+            hide_index=True,
+            column_config={
+                "日付": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                "セット番号": st.column_config.NumberColumn(min_value=1, step=1),
+                "重さ_kg": st.column_config.NumberColumn(min_value=0.0, step=2.5),
+                "回数": st.column_config.NumberColumn(min_value=1, step=1),
+                "RPE": st.column_config.NumberColumn(min_value=0.0, max_value=10.0, step=0.5),
+                "休憩秒": st.column_config.NumberColumn(min_value=0, step=15),
+            },
+            key="parsed_logs_editor",
+        )
+        if st.button("解析結果を保存"):
+            records_to_save = editable_logs_to_records(edited_df)
+            repository = get_repository()
+            for exercise_name in st.session_state.get("parsed_new_exercises", []):
+                repository.add_exercise(exercise_name)
+            for record in records_to_save:
+                repository.add_exercise(record["exercise"])
+            repository.append_log_rows(records_to_save)
+            st.session_state["parsed_log_records"] = []
+            st.session_state["parsed_new_exercises"] = []
+            st.success(f"{len(records_to_save)} 件のログを保存しました。")
+            st.rerun()
+
+
+def render_log_management(logs: list[dict[str, Any]]) -> None:
+    st.subheader("ログ管理")
+    if not logs:
+        st.info("ログがまだありません。")
+        return
+
+    selectable = logs[:100]
+    labels = {
+        row["_row_number"]: (
+            f"{row['日付']} | {row['種目']} | Set {row['セット番号']} | "
+            f"{format_number(row['重さ_kg'])}kg x {row['回数']}"
+        )
+        for row in selectable
+    }
+    row_number = st.selectbox(
+        "編集するログ",
+        options=list(labels.keys()),
+        format_func=lambda value: labels[value],
+    )
+    target = next(row for row in selectable if row["_row_number"] == row_number)
+    exercises = available_exercises()
+    if target["種目"] not in exercises:
+        exercises = [target["種目"], *exercises]
+
+    with st.form("edit_log_form"):
+        left, right = st.columns(2)
+        with left:
+            selected_date = st.date_input("日付", value=parse_date(target["日付"]))
+            exercise = st.selectbox(
+                "種目",
+                options=exercises,
+                index=exercises.index(target["種目"]) if target["種目"] in exercises else 0,
+            )
+            set_number = st.number_input(
+                "セット番号",
+                min_value=1,
+                value=int(target["セット番号"]),
+                step=1,
+            )
+            weight_kg = st.number_input(
+                "重さ(kg)",
+                min_value=0.0,
+                value=float(target["重さ_kg"]),
+                step=2.5,
+            )
+        with right:
+            reps = st.number_input("回数", min_value=1, value=int(target["回数"]), step=1)
+            rpe = st.selectbox(
+                "RPE",
+                options=RPE_OPTIONS,
+                index=RPE_OPTIONS.index(target["RPE"]) if target["RPE"] in RPE_OPTIONS else 0,
+                format_func=format_rpe,
+            )
+            rest_seconds = st.number_input(
+                "休憩秒",
+                min_value=0,
+                value=int(target["休憩秒"] or 0),
+                step=15,
+            )
+            note = st.text_input("ノート", value=target["ノート"])
+
+        update_clicked = st.form_submit_button("更新", type="primary")
+
+    if update_clicked:
+        get_repository().update_log_row(
+            row_number,
+            {
+                "date": selected_date.isoformat(),
+                "exercise": exercise,
+                "set_number": int(set_number),
+                "weight_kg": float(weight_kg),
+                "reps": int(reps),
+                "rpe": rpe,
+                "rest_seconds": None if int(rest_seconds) == 0 else int(rest_seconds),
+                "note": note,
+            },
+            created_at=target["作成日時"] or "=NOW()",
+        )
+        st.success("ログを更新しました。")
+        st.rerun()
+
+    confirm_delete = st.checkbox("このログを削除する")
+    if st.button("削除", disabled=not confirm_delete):
+        get_repository().delete_log_row(row_number)
+        st.success("ログを削除しました。")
+        st.rerun()
+
+
+def render_advice_tab(
+    logs: list[dict[str, Any]],
+    selected_model: str,
+    selected_thinking_level: str,
+) -> None:
+    st.subheader("AI相談")
+    repository = get_repository()
+    today = current_time().date()
+    today_summary = summarize_today_logs(logs, today)
+    trend_summary = summarize_recent_progress(logs, lookback_days=14)
+    recent_advice = repository.load_advice_history(days=2)
+
+    left, right = st.columns([1, 1])
+    with left:
+        with st.container(border=True):
+            st.caption("今日のメニュー")
+            st.write(today_summary)
+    with right:
+        with st.container(border=True):
+            st.caption("昨日・今日の相談履歴")
+            if recent_advice:
+                advice_df = pd.DataFrame(recent_advice)[["実行日時", "相談内容", "回答"]]
+                st.dataframe(advice_df, use_container_width=True, hide_index=True)
+            else:
+                st.write("相談履歴はまだありません。")
+
+    question = st.text_area(
+        "相談内容",
+        height=140,
+        placeholder="今日のベンチプレスが重かった。次回の重量設定と補助種目を提案して。",
+    )
+    if st.button("アドバイスをもらう", type="primary"):
+        if not normalize_text(question):
+            st.warning("相談内容を入力してください。")
+            return
+        try:
+            advice = get_gemini_client().generate_training_advice(
+                question=question,
+                now=current_time(),
+                today_summary=today_summary,
+                trend_summary=trend_summary,
+                recent_logs=logs,
+                recent_advice=recent_advice,
+                model=selected_model,
+                thinking_level=selected_thinking_level,
+            )
+        except GeminiAPIError as exc:
+            st.error(f"アドバイス生成に失敗しました: {exc}")
+        else:
+            executed_at = current_time().isoformat(timespec="seconds")
+            repository.append_advice_history(
+                {
+                    "実行日時": executed_at,
+                    "相談内容": question.strip(),
+                    "回答": "\n".join([advice["summary"], *advice["advice"]]).strip(),
+                    "回答JSON": json_dumps(advice["_raw"]),
+                    "今日のメニュー": today_summary,
+                    "参照開始日": min((row["日付"] for row in logs), default=today.isoformat()),
+                    "参照終了日": max((row["日付"] for row in logs), default=today.isoformat()),
+                    "参照ログ件数": len(logs),
+                    "モデル": f"{selected_model} ({selected_thinking_level})",
+                }
+            )
+            st.session_state["last_advice"] = advice
+            st.success("アドバイスを保存しました。")
+            st.rerun()
+
+    advice = st.session_state.get("last_advice")
+    if advice:
+        with st.container(border=True):
+            st.markdown(f"**要約**\n\n{advice['summary'] or '要約なし'}")
+            if advice["advice"]:
+                st.markdown("**提案**")
+                for item in advice["advice"]:
+                    st.write(f"- {item}")
+            st.markdown(f"**次回の重点**\n\n{advice['next_workout_focus'] or 'なし'}")
+            st.markdown(f"**注意点**\n\n{advice['caution'] or 'なし'}")
+
+
+def main() -> None:
+    ensure_session_state()
+    selected_model, selected_thinking_level = render_sidebar()
+    recent_logs = get_repository().load_logs(days=14)
+    all_logs = get_repository().load_logs(days=None)
+
+    st.title("筋トレログアプリ")
+    st.caption("手入力、自然言語入力、LLMアドバイス、Google Sheets 保存をまとめた Streamlit アプリです。")
+
+    tab_dashboard, tab_manual, tab_nl, tab_manage, tab_advice = st.tabs(
+        ["ダッシュボード", "手入力", "自然言語入力", "ログ管理", "AI相談"]
+    )
+    with tab_dashboard:
+        render_dashboard(recent_logs)
+    with tab_manual:
+        render_manual_entry(recent_logs)
+    with tab_nl:
+        render_natural_language_entry(selected_model, selected_thinking_level)
+    with tab_manage:
+        render_log_management(all_logs)
+    with tab_advice:
+        render_advice_tab(recent_logs, selected_model, selected_thinking_level)
+
+
+if __name__ == "__main__":
+    main()
