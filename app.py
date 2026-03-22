@@ -7,6 +7,7 @@ from typing import Any
 
 import pandas as pd
 import streamlit as st
+import streamlit_authenticator as stauth
 
 
 def _streamlit_secrets_into_environ() -> None:
@@ -131,6 +132,58 @@ def ensure_session_state() -> None:
     st.session_state.setdefault("parsed_log_records", [])
     st.session_state.setdefault("parsed_new_exercises", [])
     st.session_state.setdefault("last_advice", None)
+
+
+def _secret_section_to_dict(value: Any) -> Any:
+    if hasattr(value, "to_dict"):
+        return {key: _secret_section_to_dict(item) for key, item in value.to_dict().items()}
+    if isinstance(value, dict):
+        return {key: _secret_section_to_dict(item) for key, item in value.items()}
+    return value
+
+
+def get_authenticator() -> stauth.Authenticate:
+    try:
+        auth_config = _secret_section_to_dict(st.secrets["auth"])
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError("`auth` 設定が secrets.toml にありません。") from exc
+
+    credentials = auth_config.get("credentials")
+    cookie = auth_config.get("cookie", {})
+    if not credentials:
+        raise RuntimeError("`auth.credentials` が secrets.toml にありません。")
+    return stauth.Authenticate(
+        credentials,
+        cookie.get("name", "muscle_training_cookie"),
+        cookie.get("key", "change-this-cookie-key"),
+        float(cookie.get("expiry_days", 30)),
+        auto_hash=False,
+    )
+
+
+def require_login() -> None:
+    authenticator = get_authenticator()
+    name, authentication_status, username = authenticator.login(
+        location="main",
+        key="muscle_training_login",
+        fields={
+            "Form name": "ログイン",
+            "Username": "ID",
+            "Password": "パスワード",
+            "Login": "ログイン",
+        },
+    )
+
+    if authentication_status:
+        st.sidebar.caption("ログイン中")
+        st.sidebar.write(f"{name} ({username})")
+        authenticator.logout("ログアウト", "sidebar", key="muscle_training_logout")
+        return
+    if authentication_status is False:
+        st.error("ID またはパスワードが違います。")
+    else:
+        st.info("ログインしてください。")
+    st.stop()
 
 
 def render_sidebar() -> tuple[str, str]:
@@ -534,6 +587,7 @@ def render_advice_tab(
 
 
 def main() -> None:
+    require_login()
     ensure_session_state()
     selected_model, selected_thinking_level = render_sidebar()
     recent_logs = get_repository().load_logs(days=14)

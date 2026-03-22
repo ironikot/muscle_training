@@ -24,6 +24,10 @@ streamlit run app.py
 
 `.streamlit/secrets.toml` は [`.streamlit/secrets.toml.example`](/Users/tokinorishimodaira/Desktop/outof-work/muscle_training_app/.streamlit/secrets.toml.example) と同じ構造にしてください。
 
+## 認証
+
+アプリ起動時に ID / パスワード認証を行います。公開運用時は `.streamlit/secrets.toml` の `auth` セクションでユーザーとパスワードハッシュを管理してください。
+
 ## 疎通確認
 
 ```bash

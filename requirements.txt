@@ -5,3 +5,4 @@ requests>=2.32.0
 gspread>=6.2.0
 google-auth>=2.40.0
 pytest>=8.3.0
+streamlit-authenticator>=0.4.2
