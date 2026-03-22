@@ -163,7 +163,7 @@ def get_authenticator() -> stauth.Authenticate:
 
 def require_login() -> None:
     authenticator = get_authenticator()
-    name, authentication_status, username = authenticator.login(
+    authenticator.login(
         location="main",
         key="muscle_training_login",
         fields={
@@ -173,6 +173,9 @@ def require_login() -> None:
             "Login": "ログイン",
         },
     )
+    name = st.session_state.get("name")
+    authentication_status = st.session_state.get("authentication_status")
+    username = st.session_state.get("username")
 
     if authentication_status:
         st.sidebar.caption("ログイン中")
