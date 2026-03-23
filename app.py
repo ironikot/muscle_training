@@ -45,6 +45,8 @@ def _streamlit_secrets_into_environ() -> None:
 _streamlit_secrets_into_environ()
 
 from muscle_training_app.domain import (
+    DEFAULT_GOAL_TEXT,
+    DEFAULT_NOTE_TEXT,
     LOG_HEADERS,
     MODEL_THINKING_LEVELS,
     RPE_OPTIONS,
@@ -65,6 +67,8 @@ from muscle_training_app.sheets_repo import GoogleSheetsRepository
 
 st.set_page_config(page_title="筋トレログアプリ", page_icon="🏋️", layout="wide")
 
+REPOSITORY_CACHE_VERSION = "profile-v1"
+
 
 @st.cache_resource(show_spinner=False)
 def get_settings() -> AppSettings:
@@ -72,7 +76,8 @@ def get_settings() -> AppSettings:
 
 
 @st.cache_resource(show_spinner=False)
-def get_repository() -> GoogleSheetsRepository:
+def get_repository(cache_version: str = REPOSITORY_CACHE_VERSION) -> GoogleSheetsRepository:
+    del cache_version
     settings = get_settings()
     repository = GoogleSheetsRepository(
         spreadsheet_url=settings.spreadsheet_url,
@@ -85,6 +90,25 @@ def get_repository() -> GoogleSheetsRepository:
     )
     repository.ensure_schema()
     return repository
+
+
+def load_profile_settings() -> dict[str, str]:
+    repository = get_repository()
+    if hasattr(repository, "load_profile"):
+        return repository.load_profile()
+    return {
+        "goal": DEFAULT_GOAL_TEXT,
+        "note": DEFAULT_NOTE_TEXT,
+    }
+
+
+def save_profile_settings(*, goal: str, note: str) -> bool:
+    repository = get_repository()
+    if hasattr(repository, "save_profile"):
+        repository.save_profile(goal=goal, note=note)
+        return True
+    st.warning("プロファイル保存機能の初期化が未完了です。アプリを再読み込みしてください。")
+    return False
 
 
 @st.cache_resource(show_spinner=False)
@@ -522,7 +546,7 @@ def render_advice_tab(
     today_summary = summarize_today_logs(logs, today)
     trend_summary = summarize_recent_progress(logs, lookback_days=14)
     recent_advice = repository.load_advice_history(days=2)
-    profile = repository.load_profile()
+    profile = load_profile_settings()
 
     left, right = st.columns([1, 1])
     with left:
@@ -553,9 +577,9 @@ def render_advice_tab(
         )
         save_profile_clicked = st.form_submit_button("目標・備考を保存")
     if save_profile_clicked:
-        repository.save_profile(goal=goal_text, note=note_text)
-        st.success("目標・備考を保存しました。")
-        st.rerun()
+        if save_profile_settings(goal=goal_text, note=note_text):
+            st.success("目標・備考を保存しました。")
+            st.rerun()
 
     question = st.text_area(
         "相談内容",
