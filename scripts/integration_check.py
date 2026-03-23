@@ -117,9 +117,12 @@ def main() -> None:
     )
     print("Parse sample:", json_dumps(parsed))
     recent_logs = repository.load_logs(days=14)
+    profile = repository.load_profile()
     advice = client.generate_training_advice(
         question="今日の内容を踏まえて、次回のベンチプレス重量設定を提案して。",
         now=datetime.now(settings.timezone),
+        goal_text=profile["goal"],
+        note_text=profile["note"],
         today_summary=summarize_today_logs(recent_logs, datetime.now(settings.timezone).date()),
         trend_summary=summarize_recent_progress(recent_logs, lookback_days=14),
         recent_logs=recent_logs,

@@ -132,6 +132,7 @@ def ensure_session_state() -> None:
     st.session_state.setdefault("parsed_log_records", [])
     st.session_state.setdefault("parsed_new_exercises", [])
     st.session_state.setdefault("last_advice", None)
+    st.session_state.setdefault("advice_question", "")
 
 
 def _secret_section_to_dict(value: Any) -> Any:
@@ -521,6 +522,7 @@ def render_advice_tab(
     today_summary = summarize_today_logs(logs, today)
     trend_summary = summarize_recent_progress(logs, lookback_days=14)
     recent_advice = repository.load_advice_history(days=2)
+    profile = repository.load_profile()
 
     left, right = st.columns([1, 1])
     with left:
@@ -536,12 +538,42 @@ def render_advice_tab(
             else:
                 st.write("相談履歴はまだありません。")
 
+    st.divider()
+    st.caption("相談の前提")
+    with st.form("advice_profile_form"):
+        goal_text = st.text_area(
+            "① なりたい姿・目標",
+            value=profile["goal"],
+            height=120,
+        )
+        note_text = st.text_area(
+            "② 備考",
+            value=profile["note"],
+            height=100,
+        )
+        save_profile_clicked = st.form_submit_button("目標・備考を保存")
+    if save_profile_clicked:
+        repository.save_profile(goal=goal_text, note=note_text)
+        st.success("目標・備考を保存しました。")
+        st.rerun()
+
     question = st.text_area(
         "相談内容",
+        key="advice_question",
         height=140,
         placeholder="今日のベンチプレスが重かった。次回の重量設定と補助種目を提案して。",
     )
-    if st.button("アドバイスをもらう", type="primary"):
+    ask_col, clear_col = st.columns([1, 1])
+    with ask_col:
+        ask_clicked = st.button("アドバイスをもらう", type="primary")
+    with clear_col:
+        clear_clicked = st.button("前回入力をクリア")
+
+    if clear_clicked:
+        st.session_state["advice_question"] = ""
+        st.rerun()
+
+    if ask_clicked:
         if not normalize_text(question):
             st.warning("相談内容を入力してください。")
             return
@@ -549,6 +581,8 @@ def render_advice_tab(
             advice = get_gemini_client().generate_training_advice(
                 question=question,
                 now=current_time(),
+                goal_text=profile["goal"],
+                note_text=profile["note"],
                 today_summary=today_summary,
                 trend_summary=trend_summary,
                 recent_logs=logs,
@@ -574,6 +608,7 @@ def render_advice_tab(
                 }
             )
             st.session_state["last_advice"] = advice
+            st.session_state["advice_question"] = question
             st.success("アドバイスを保存しました。")
             st.rerun()
 

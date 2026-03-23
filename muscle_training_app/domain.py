@@ -55,6 +55,16 @@ ADVICE_HEADERS: Final = [
     "参照ログ件数",
     "モデル",
 ]
+PROFILE_SHEET_NAME: Final = "advice_profile"
+PROFILE_HEADERS: Final = ["key", "value", "updated_at"]
+DEFAULT_GOAL_TEXT: Final = (
+    "片手懸垂とマッスルアップができるようになりたくて、"
+    "ベンチプレスは100kgを目指したい、体脂肪率は17％台に落としたい、"
+    "一日にできる筋トレ時間は25分ほどです。"
+)
+DEFAULT_NOTE_TEXT: Final = (
+    "筋トレのログの斜度ウォークは、ウォーキングマシンで15度の斜度をつけて歩くものです。"
+)
 
 RPE_OPTIONS: Final = [None, *[index / 2 for index in range(0, 21)]]
 RPE_DESCRIPTIONS: Final = {

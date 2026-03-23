@@ -117,6 +117,8 @@ class GeminiClient:
         *,
         question: str,
         now: datetime,
+        goal_text: str,
+        note_text: str,
         today_summary: str,
         trend_summary: str,
         recent_logs: list[dict[str, Any]],
@@ -129,6 +131,12 @@ class GeminiClient:
 回答は必ず JSON のみで返してください。
 
 現在日時: {now.isoformat(timespec="seconds")}
+目標:
+{goal_text.strip()}
+
+備考:
+{note_text.strip()}
+
 今日のメニュー要約:
 {today_summary}
 
@@ -154,6 +162,7 @@ class GeminiClient:
 
 ルール:
 - 今日の内容、過去2週間の負荷推移、相談履歴を踏まえて答えてください。
+- 目標と備考は優先条件として扱ってください。
 - 重量、回数、RPE の調整案は、可能なら具体的な数値で返してください。
 - 無理な断定は避け、記録不足ならその前提を短く明示してください。
 - advice は 2〜4 件の短い文にしてください。

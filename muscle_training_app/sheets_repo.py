@@ -11,10 +11,14 @@ from .domain import (
     ADVICE_HEADERS,
     ADVICE_SHEET_NAME,
     DEFAULT_EXERCISES,
+    DEFAULT_GOAL_TEXT,
+    DEFAULT_NOTE_TEXT,
     EXERCISE_HEADERS,
     EXERCISE_SHEET_NAME,
     LOG_HEADERS,
     LOG_SHEET_NAME,
+    PROFILE_HEADERS,
+    PROFILE_SHEET_NAME,
     format_number,
     normalize_log_record,
     normalize_optional_float,
@@ -62,7 +66,9 @@ class GoogleSheetsRepository:
         self._ensure_headers(LOG_SHEET_NAME, LOG_HEADERS, cols=12)
         self._ensure_headers(EXERCISE_SHEET_NAME, EXERCISE_HEADERS, cols=6)
         self._ensure_headers(ADVICE_SHEET_NAME, ADVICE_HEADERS, cols=12)
+        self._ensure_headers(PROFILE_SHEET_NAME, PROFILE_HEADERS, cols=4)
         self._seed_default_exercises()
+        self._seed_default_profile()
 
     def get_meta(self) -> SpreadsheetMeta:
         return SpreadsheetMeta(
@@ -244,6 +250,38 @@ class GoogleSheetsRepository:
             value_input_option="USER_ENTERED",
         )
 
+    def load_profile(self) -> dict[str, str]:
+        worksheet = self._worksheet(PROFILE_SHEET_NAME)
+        rows = worksheet.get_all_values()
+        if not rows:
+            return {
+                "goal": DEFAULT_GOAL_TEXT,
+                "note": DEFAULT_NOTE_TEXT,
+            }
+        profile = {
+            "goal": DEFAULT_GOAL_TEXT,
+            "note": DEFAULT_NOTE_TEXT,
+        }
+        for values in rows[1:]:
+            key = normalize_text(values[0] if len(values) > 0 else "")
+            value = normalize_text(values[1] if len(values) > 1 else "")
+            if key == "goal" and value:
+                profile["goal"] = value
+            if key == "note" and value:
+                profile["note"] = value
+        return profile
+
+    def save_profile(self, *, goal: str, note: str) -> None:
+        worksheet = self._worksheet(PROFILE_SHEET_NAME)
+        values = [
+            PROFILE_HEADERS,
+            ["goal", normalize_text(goal), "=NOW()"],
+            ["note", normalize_text(note), "=NOW()"],
+        ]
+        worksheet.clear()
+        worksheet.update(values, value_input_option="USER_ENTERED")
+        worksheet.freeze(rows=1)
+
     def _serialize_log_row(
         self,
         record: dict[str, Any],
@@ -273,6 +311,17 @@ class GoogleSheetsRepository:
             missing = DEFAULT_EXERCISES
         for name in missing:
             self.add_exercise(name)
+
+    def _seed_default_profile(self) -> None:
+        worksheet = self._worksheet(PROFILE_SHEET_NAME)
+        rows = worksheet.get_all_values()
+        if len(rows) <= 1:
+            self.save_profile(goal=DEFAULT_GOAL_TEXT, note=DEFAULT_NOTE_TEXT)
+            return
+        existing = {normalize_text(values[0] if len(values) > 0 else "") for values in rows[1:]}
+        if "goal" not in existing or "note" not in existing:
+            profile = self.load_profile()
+            self.save_profile(goal=profile["goal"], note=profile["note"])
 
     def _worksheet(self, sheet_name: str):
         worksheet = self._try_get_worksheet(sheet_name)
