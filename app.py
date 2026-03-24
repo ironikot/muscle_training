@@ -112,6 +112,10 @@ def save_profile_settings(*, goal: str, note: str) -> bool:
     return False
 
 
+def clear_advice_question() -> None:
+    st.session_state["advice_question"] = ""
+
+
 @st.cache_resource(show_spinner=False)
 def get_gemini_client(cache_version: str = GEMINI_CLIENT_CACHE_VERSION) -> GeminiClient:
     del cache_version
@@ -640,11 +644,7 @@ def render_advice_tab(
     with ask_col:
         ask_clicked = st.button("アドバイスをもらう", type="primary")
     with clear_col:
-        clear_clicked = st.button("前回入力をクリア")
-
-    if clear_clicked:
-        st.session_state["advice_question"] = ""
-        st.rerun()
+        st.button("前回入力をクリア", on_click=clear_advice_question)
 
     if ask_clicked:
         if not normalize_text(question):
@@ -685,7 +685,6 @@ def render_advice_tab(
                 }
             )
             st.session_state["last_advice"] = advice
-            st.session_state["advice_question"] = question
             st.success("アドバイスを保存しました。")
             st.rerun()
 
