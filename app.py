@@ -68,6 +68,7 @@ from muscle_training_app.sheets_repo import GoogleSheetsRepository
 st.set_page_config(page_title="筋トレログアプリ", page_icon="🏋️", layout="wide")
 
 REPOSITORY_CACHE_VERSION = "profile-v1"
+GEMINI_CLIENT_CACHE_VERSION = "advice-profile-v1"
 
 
 @st.cache_resource(show_spinner=False)
@@ -112,7 +113,8 @@ def save_profile_settings(*, goal: str, note: str) -> bool:
 
 
 @st.cache_resource(show_spinner=False)
-def get_gemini_client() -> GeminiClient:
+def get_gemini_client(cache_version: str = GEMINI_CLIENT_CACHE_VERSION) -> GeminiClient:
+    del cache_version
     settings = get_settings()
     return GeminiClient(
         api_keys=settings.api_keys,
@@ -157,6 +159,14 @@ def ensure_session_state() -> None:
     st.session_state.setdefault("parsed_new_exercises", [])
     st.session_state.setdefault("last_advice", None)
     st.session_state.setdefault("advice_question", "")
+    st.session_state.setdefault("manual_date", current_time().date())
+    st.session_state.setdefault("manual_exercise", "")
+    st.session_state.setdefault("manual_set_number", 1)
+    st.session_state.setdefault("manual_weight_kg", 40.0)
+    st.session_state.setdefault("manual_reps", 5)
+    st.session_state.setdefault("manual_rpe", None)
+    st.session_state.setdefault("manual_rest_seconds", 180)
+    st.session_state.setdefault("manual_note", "")
 
 
 def _secret_section_to_dict(value: Any) -> Any:
@@ -216,10 +226,14 @@ def require_login() -> None:
 
 def render_sidebar() -> tuple[str, str]:
     settings = get_settings()
-    repository = get_repository()
-    meta = repository.get_meta()
     st.sidebar.caption("接続先")
-    st.sidebar.write(meta.title)
+    try:
+        repository = get_repository()
+        meta = repository.get_meta()
+        st.sidebar.write(meta.title)
+    except Exception:
+        meta = None
+        st.sidebar.warning("スプレッドシート接続を確認できません。権限または secrets を確認してください。")
     st.sidebar.caption("セッション開始")
     st.sidebar.write(st.session_state["app_opened_at"])
     selected_model = st.sidebar.selectbox(
@@ -236,8 +250,9 @@ def render_sidebar() -> tuple[str, str]:
         index=0,
         help="Gemini 3 系の thinking level を指定します。",
     )
-    st.sidebar.caption("ワークシート")
-    st.sidebar.write(", ".join(meta.worksheet_titles))
+    if meta is not None:
+        st.sidebar.caption("ワークシート")
+        st.sidebar.write(", ".join(meta.worksheet_titles))
     return selected_model, selected_thinking_level
 
 
@@ -282,40 +297,73 @@ def render_manual_entry(logs: list[dict[str, Any]]) -> None:
     st.subheader("手入力")
     repository = get_repository()
     exercises = available_exercises()
-    default_date = current_time().date()
     if not exercises:
         st.warning("種目マスターが空です。先に種目を追加してください。")
         return
+    if not st.session_state["manual_exercise"] or st.session_state["manual_exercise"] not in exercises:
+        st.session_state["manual_exercise"] = exercises[0]
+    if st.session_state["manual_set_number"] < 1:
+        st.session_state["manual_set_number"] = next_set_number(
+            logs,
+            st.session_state["manual_date"],
+            st.session_state["manual_exercise"],
+        )
 
-    with st.form("manual_entry_form", clear_on_submit=True):
+    with st.form("manual_entry_form"):
         left, right = st.columns(2)
         with left:
-            selected_date = st.date_input("日付", value=default_date)
-            exercise = st.selectbox("種目", options=exercises)
+            selected_date = st.date_input("日付", value=st.session_state["manual_date"])
+            exercise = st.selectbox(
+                "種目",
+                options=exercises,
+                index=exercises.index(st.session_state["manual_exercise"]),
+            )
             set_number = st.number_input(
                 "セット番号",
                 min_value=1,
-                value=next_set_number(logs, selected_date, exercise),
+                value=int(st.session_state["manual_set_number"]),
                 step=1,
             )
-            weight_kg = st.number_input("重さ(kg)", min_value=0.0, value=40.0, step=2.5)
+            weight_kg = st.number_input(
+                "重さ(kg)",
+                min_value=0.0,
+                value=float(st.session_state["manual_weight_kg"]),
+                step=2.5,
+            )
         with right:
-            reps = st.number_input("回数", min_value=1, value=5, step=1)
+            reps = st.number_input(
+                "回数",
+                min_value=1,
+                value=int(st.session_state["manual_reps"]),
+                step=1,
+            )
             rpe = st.selectbox(
                 "RPE",
                 options=RPE_OPTIONS,
+                index=RPE_OPTIONS.index(st.session_state["manual_rpe"])
+                if st.session_state["manual_rpe"] in RPE_OPTIONS
+                else 0,
                 format_func=format_rpe,
             )
             rest_seconds = st.number_input(
                 "休憩秒",
                 min_value=0,
-                value=180,
+                value=int(st.session_state["manual_rest_seconds"]),
                 step=15,
                 help="0 の場合は未入力扱いにします。",
             )
-            note = st.text_input("ノート")
+            note = st.text_input("ノート", value=st.session_state["manual_note"])
 
         submitted = st.form_submit_button("このセットを追加", type="primary")
+
+    st.session_state["manual_date"] = selected_date
+    st.session_state["manual_exercise"] = exercise
+    st.session_state["manual_set_number"] = int(set_number)
+    st.session_state["manual_weight_kg"] = float(weight_kg)
+    st.session_state["manual_reps"] = int(reps)
+    st.session_state["manual_rpe"] = rpe
+    st.session_state["manual_rest_seconds"] = int(rest_seconds)
+    st.session_state["manual_note"] = note
 
     if submitted:
         repository.append_log_rows(
@@ -332,6 +380,7 @@ def render_manual_entry(logs: list[dict[str, Any]]) -> None:
                 }
             ]
         )
+        st.session_state["manual_set_number"] = int(set_number) + 1
         st.success("ログを追加しました。")
         st.rerun()
 
@@ -602,7 +651,8 @@ def render_advice_tab(
             st.warning("相談内容を入力してください。")
             return
         try:
-            advice = get_gemini_client().generate_training_advice(
+            advice_client = get_gemini_client()
+            advice = advice_client.generate_training_advice(
                 question=question,
                 now=current_time(),
                 goal_text=profile["goal"],
@@ -614,6 +664,9 @@ def render_advice_tab(
                 model=selected_model,
                 thinking_level=selected_thinking_level,
             )
+        except TypeError:
+            st.error("AI相談機能のキャッシュが古い可能性があります。再読み込み後にもう一度お試しください。")
+            return
         except GeminiAPIError as exc:
             st.error(f"アドバイス生成に失敗しました: {exc}")
         else:
@@ -652,8 +705,13 @@ def main() -> None:
     require_login()
     ensure_session_state()
     selected_model, selected_thinking_level = render_sidebar()
-    recent_logs = get_repository().load_logs(days=14)
-    all_logs = get_repository().load_logs(days=None)
+    try:
+        repository = get_repository()
+        recent_logs = repository.load_logs(days=14)
+        all_logs = repository.load_logs(days=None)
+    except Exception:
+        st.error("Google スプレッドシートに接続できません。共有権限または secrets の設定を確認してください。")
+        st.stop()
 
     st.title("筋トレログアプリ")
     st.caption("手入力、自然言語入力、LLMアドバイス、Google Sheets 保存をまとめた Streamlit アプリです。")
