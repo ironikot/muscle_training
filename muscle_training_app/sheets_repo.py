@@ -106,7 +106,7 @@ class GoogleSheetsRepository:
             )
 
         normalized.sort(
-            key=lambda item: (item["日付"], item["種目"], int(item["セット番号"] or 0)),
+            key=lambda item: int(item["_row_number"]),
             reverse=True,
         )
         if days is None or not normalized:
@@ -116,11 +116,13 @@ class GoogleSheetsRepository:
         if latest is None:
             return normalized
         cutoff = latest.toordinal() - max(days - 1, 0)
-        return [
+        filtered = [
             row
             for row in normalized
             if parse_date(row["日付"]) and parse_date(row["日付"]).toordinal() >= cutoff
         ]
+        filtered.sort(key=lambda item: int(item["_row_number"]), reverse=True)
+        return filtered
 
     def append_log_rows(self, records: list[dict[str, Any]]) -> None:
         if not records:
