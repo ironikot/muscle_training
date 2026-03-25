@@ -142,6 +142,10 @@ def reset_repository_connection() -> None:
     get_repository.clear()
 
 
+def reset_gemini_client() -> None:
+    get_gemini_client.clear()
+
+
 def repository_read(operation, *, fallback):
     try:
         return operation(get_repository())
@@ -810,9 +814,27 @@ def render_advice_tab(
                 model=selected_model,
                 thinking_level=selected_thinking_level,
             )
-        except TypeError:
-            st.error("AI相談機能のキャッシュが古い可能性があります。再読み込み後にもう一度お試しください。")
-            return
+        except TypeError as exc:
+            reset_gemini_client()
+            try:
+                advice = get_gemini_client().generate_training_advice(
+                    question=question,
+                    now=current_time(),
+                    goal_text=profile["goal"],
+                    note_text=profile["note"],
+                    planned_stay_minutes=int(planned_minutes),
+                    planned_stay_recorded_at=planned_set_at,
+                    remaining_minutes=remaining_minutes,
+                    today_summary=today_summary,
+                    trend_summary=trend_summary,
+                    recent_logs=logs,
+                    recent_advice=recent_advice,
+                    model=selected_model,
+                    thinking_level=selected_thinking_level,
+                )
+            except TypeError as retry_exc:
+                st.error(f"AI相談の内部エラーです: {retry_exc}")
+                return
         except GeminiAPIError as exc:
             st.error(f"アドバイス生成に失敗しました: {exc}")
         else:
