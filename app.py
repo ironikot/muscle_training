@@ -4,7 +4,9 @@ import json
 import os
 from datetime import datetime
 from typing import Any
+from uuid import uuid4
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 import streamlit_authenticator as stauth
@@ -94,10 +96,19 @@ def get_repository(cache_version: str = REPOSITORY_CACHE_VERSION) -> GoogleSheet
 
 
 def load_profile_settings() -> dict[str, str]:
-    repository = get_repository()
-    if hasattr(repository, "load_profile"):
-        return repository.load_profile()
-    return {
+    profile = repository_read(
+        lambda repository: repository.load_profile()
+        if hasattr(repository, "load_profile")
+        else {
+            "goal": DEFAULT_GOAL_TEXT,
+            "note": DEFAULT_NOTE_TEXT,
+        },
+        fallback={
+            "goal": DEFAULT_GOAL_TEXT,
+            "note": DEFAULT_NOTE_TEXT,
+        },
+    )
+    return profile or {
         "goal": DEFAULT_GOAL_TEXT,
         "note": DEFAULT_NOTE_TEXT,
     }
@@ -106,14 +117,53 @@ def load_profile_settings() -> dict[str, str]:
 def save_profile_settings(*, goal: str, note: str) -> bool:
     repository = get_repository()
     if hasattr(repository, "save_profile"):
-        repository.save_profile(goal=goal, note=note)
-        return True
+        try:
+            repository.save_profile(goal=goal, note=note)
+            return True
+        except Exception:
+            reset_repository_connection()
+            repository = get_repository()
+            if hasattr(repository, "save_profile"):
+                repository.save_profile(goal=goal, note=note)
+                return True
     st.warning("プロファイル保存機能の初期化が未完了です。アプリを再読み込みしてください。")
     return False
 
 
 def clear_advice_question() -> None:
     st.session_state["advice_question"] = ""
+
+
+def mark_planned_minutes_updated() -> None:
+    st.session_state["advice_planned_minutes_set_at"] = current_time().isoformat(timespec="seconds")
+
+
+def reset_repository_connection() -> None:
+    get_repository.clear()
+
+
+def repository_read(operation, *, fallback):
+    try:
+        return operation(get_repository())
+    except Exception:
+        reset_repository_connection()
+        try:
+            return operation(get_repository())
+        except Exception:
+            return fallback
+
+
+def repository_write(operation) -> bool:
+    try:
+        operation(get_repository())
+        return True
+    except Exception:
+        reset_repository_connection()
+        try:
+            operation(get_repository())
+            return True
+        except Exception:
+            return False
 
 
 @st.cache_resource(show_spinner=False)
@@ -131,9 +181,10 @@ def current_time() -> datetime:
 
 
 def available_exercises() -> list[str]:
-    repository = get_repository()
-    names = repository.list_exercises(active_only=True)
-    return names
+    return repository_read(
+        lambda repository: repository.list_exercises(active_only=True),
+        fallback=[],
+    )
 
 
 def logs_to_dataframe(logs: list[dict[str, Any]]) -> pd.DataFrame:
@@ -171,6 +222,39 @@ def ensure_session_state() -> None:
     st.session_state.setdefault("manual_rpe", None)
     st.session_state.setdefault("manual_rest_seconds", 180)
     st.session_state.setdefault("manual_note", "")
+    st.session_state.setdefault("manual_prefill_marker", "")
+    st.session_state.setdefault("advice_planned_minutes", 25)
+    st.session_state.setdefault(
+        "advice_planned_minutes_set_at",
+        current_time().isoformat(timespec="seconds"),
+    )
+
+
+def hydrate_manual_entry_defaults(logs: list[dict[str, Any]]) -> None:
+    if not logs:
+        return
+    today_key = current_time().date().isoformat()
+    today_logs = [row for row in logs if row.get("日付") == today_key]
+    latest_today_log = (
+        max(today_logs, key=lambda row: int(row.get("_row_number", 0) or 0))
+        if today_logs
+        else None
+    )
+    marker = f"{today_key}:{latest_today_log.get('_row_number') if latest_today_log else 'none'}"
+    if st.session_state.get("manual_prefill_marker") == marker:
+        return
+    st.session_state["manual_date"] = current_time().date()
+    if latest_today_log:
+        st.session_state["manual_exercise"] = latest_today_log.get("種目") or st.session_state.get("manual_exercise") or ""
+        st.session_state["manual_set_number"] = int(latest_today_log.get("セット番号", 0) or 0) + 1
+        st.session_state["manual_weight_kg"] = float(latest_today_log.get("重さ_kg", 40.0) or 40.0)
+        st.session_state["manual_reps"] = int(latest_today_log.get("回数", 5) or 5)
+        st.session_state["manual_rpe"] = latest_today_log.get("RPE")
+        st.session_state["manual_rest_seconds"] = int(latest_today_log.get("休憩秒", 180) or 180)
+        st.session_state["manual_note"] = latest_today_log.get("ノート", "") or ""
+    else:
+        st.session_state["manual_set_number"] = 1
+    st.session_state["manual_prefill_marker"] = marker
 
 
 def _secret_section_to_dict(value: Any) -> Any:
@@ -231,12 +315,10 @@ def require_login() -> None:
 def render_sidebar() -> tuple[str, str]:
     settings = get_settings()
     st.sidebar.caption("接続先")
-    try:
-        repository = get_repository()
-        meta = repository.get_meta()
+    meta = repository_read(lambda repository: repository.get_meta(), fallback=None)
+    if meta is not None:
         st.sidebar.write(meta.title)
-    except Exception:
-        meta = None
+    else:
         st.sidebar.warning("スプレッドシート接続を確認できません。権限または secrets を確認してください。")
     st.sidebar.caption("セッション開始")
     st.sidebar.write(st.session_state["app_opened_at"])
@@ -293,14 +375,33 @@ def render_dashboard(logs: list[dict[str, Any]]) -> None:
         if volume_rows:
             chart_df = pd.DataFrame(volume_rows)
             chart_df["日付"] = pd.to_datetime(chart_df["日付"])
-            chart_df = chart_df.set_index("日付")
-            st.line_chart(chart_df[["総ボリューム_kg", "最大重量_kg"]], use_container_width=True)
+            chart_df["総ボリューム_kg"] = pd.to_numeric(chart_df["総ボリューム_kg"])
+            chart_df["最大重量_kg"] = pd.to_numeric(chart_df["最大重量_kg"])
+            melted = chart_df.melt(
+                id_vars=["日付"],
+                value_vars=["総ボリューム_kg", "最大重量_kg"],
+                var_name="指標",
+                value_name="値",
+            )
+            chart = (
+                alt.Chart(melted)
+                .mark_line(point=True)
+                .encode(
+                    x=alt.X("日付:T", title="日付"),
+                    y=alt.Y("値:Q", title="kg"),
+                    color=alt.Color("指標:N", title="指標"),
+                    tooltip=["日付:T", "指標:N", "値:Q"],
+                )
+                .properties(height=320)
+            )
+            st.altair_chart(chart, use_container_width=True)
+            st.dataframe(chart_df, use_container_width=True, hide_index=True)
 
 
 def render_manual_entry(logs: list[dict[str, Any]]) -> None:
     st.subheader("手入力")
-    repository = get_repository()
     exercises = available_exercises()
+    hydrate_manual_entry_defaults(logs)
     if not exercises:
         st.warning("種目マスターが空です。先に種目を追加してください。")
         return
@@ -370,23 +471,27 @@ def render_manual_entry(logs: list[dict[str, Any]]) -> None:
     st.session_state["manual_note"] = note
 
     if submitted:
-        repository.append_log_rows(
-            [
-                {
-                    "date": selected_date.isoformat(),
-                    "exercise": exercise,
-                    "set_number": int(set_number),
-                    "weight_kg": float(weight_kg),
-                    "reps": int(reps),
-                    "rpe": rpe,
-                    "rest_seconds": None if int(rest_seconds) == 0 else int(rest_seconds),
-                    "note": note,
-                }
-            ]
-        )
-        st.session_state["manual_set_number"] = int(set_number) + 1
-        st.success("ログを追加しました。")
-        st.rerun()
+        if repository_write(
+            lambda repository: repository.append_log_rows(
+                [
+                    {
+                        "date": selected_date.isoformat(),
+                        "exercise": exercise,
+                        "set_number": int(set_number),
+                        "weight_kg": float(weight_kg),
+                        "reps": int(reps),
+                        "rpe": rpe,
+                        "rest_seconds": None if int(rest_seconds) == 0 else int(rest_seconds),
+                        "note": note,
+                    }
+                ]
+            )
+        ):
+            st.session_state["manual_set_number"] = int(set_number) + 1
+            st.session_state["manual_prefill_marker"] = ""
+            st.success("ログを追加しました。")
+            st.rerun()
+        st.error("ログ追加に失敗しました。スプレッドシート接続を確認して再試行してください。")
 
     st.divider()
     st.caption("種目マスター")
@@ -395,13 +500,14 @@ def render_manual_entry(logs: list[dict[str, Any]]) -> None:
     with add_col:
         if st.button("種目を追加"):
             if normalize_text(new_exercise):
-                repository.add_exercise(new_exercise)
-                st.success("種目を追加しました。")
-                st.rerun()
+                if repository_write(lambda repository: repository.add_exercise(new_exercise)):
+                    st.success("種目を追加しました。")
+                    st.rerun()
+                st.error("種目追加に失敗しました。スプレッドシート接続を確認してください。")
             else:
                 st.warning("種目名を入力してください。")
 
-    master_rows = repository.load_exercise_records()
+    master_rows = repository_read(lambda repository: repository.load_exercise_records(), fallback=[])
     if master_rows:
         master_df = pd.DataFrame(master_rows)[["種目名", "有効", "並び順", "作成日時"]]
         edited_master = st.data_editor(
@@ -418,9 +524,12 @@ def render_manual_entry(logs: list[dict[str, Any]]) -> None:
             key="exercise_master_editor",
         )
         if st.button("種目マスターを保存"):
-            repository.save_exercise_records(edited_master.to_dict(orient="records"))
-            st.success("種目マスターを更新しました。")
-            st.rerun()
+            if repository_write(
+                lambda repository: repository.save_exercise_records(edited_master.to_dict(orient="records"))
+            ):
+                st.success("種目マスターを更新しました。")
+                st.rerun()
+            st.error("種目マスターの保存に失敗しました。")
 
 
 def render_natural_language_entry(selected_model: str, selected_thinking_level: str) -> None:
@@ -488,16 +597,19 @@ def render_natural_language_entry(selected_model: str, selected_thinking_level: 
         )
         if st.button("解析結果を保存"):
             records_to_save = editable_logs_to_records(edited_df)
-            repository = get_repository()
-            for exercise_name in st.session_state.get("parsed_new_exercises", []):
-                repository.add_exercise(exercise_name)
-            for record in records_to_save:
-                repository.add_exercise(record["exercise"])
-            repository.append_log_rows(records_to_save)
-            st.session_state["parsed_log_records"] = []
-            st.session_state["parsed_new_exercises"] = []
-            st.success(f"{len(records_to_save)} 件のログを保存しました。")
-            st.rerun()
+            def save_parsed_logs(repository: GoogleSheetsRepository) -> None:
+                for exercise_name in st.session_state.get("parsed_new_exercises", []):
+                    repository.add_exercise(exercise_name)
+                for record in records_to_save:
+                    repository.add_exercise(record["exercise"])
+                repository.append_log_rows(records_to_save)
+
+            if repository_write(save_parsed_logs):
+                st.session_state["parsed_log_records"] = []
+                st.session_state["parsed_new_exercises"] = []
+                st.success(f"{len(records_to_save)} 件のログを保存しました。")
+                st.rerun()
+            st.error("解析結果の保存に失敗しました。")
 
 
 def render_log_management(logs: list[dict[str, Any]]) -> None:
@@ -564,28 +676,32 @@ def render_log_management(logs: list[dict[str, Any]]) -> None:
         update_clicked = st.form_submit_button("更新", type="primary")
 
     if update_clicked:
-        get_repository().update_log_row(
-            row_number,
-            {
-                "date": selected_date.isoformat(),
-                "exercise": exercise,
-                "set_number": int(set_number),
-                "weight_kg": float(weight_kg),
-                "reps": int(reps),
-                "rpe": rpe,
-                "rest_seconds": None if int(rest_seconds) == 0 else int(rest_seconds),
-                "note": note,
-            },
-            created_at=target["作成日時"] or "=NOW()",
-        )
-        st.success("ログを更新しました。")
-        st.rerun()
+        if repository_write(
+            lambda repository: repository.update_log_row(
+                row_number,
+                {
+                    "date": selected_date.isoformat(),
+                    "exercise": exercise,
+                    "set_number": int(set_number),
+                    "weight_kg": float(weight_kg),
+                    "reps": int(reps),
+                    "rpe": rpe,
+                    "rest_seconds": None if int(rest_seconds) == 0 else int(rest_seconds),
+                    "note": note,
+                },
+                created_at=target["作成日時"] or "=NOW()",
+            )
+        ):
+            st.success("ログを更新しました。")
+            st.rerun()
+        st.error("ログ更新に失敗しました。")
 
     confirm_delete = st.checkbox("このログを削除する")
     if st.button("削除", disabled=not confirm_delete):
-        get_repository().delete_log_row(row_number)
-        st.success("ログを削除しました。")
-        st.rerun()
+        if repository_write(lambda repository: repository.delete_log_row(row_number)):
+            st.success("ログを削除しました。")
+            st.rerun()
+        st.error("ログ削除に失敗しました。スプレッドシート接続を確認して再試行してください。")
 
 
 def render_advice_tab(
@@ -594,11 +710,13 @@ def render_advice_tab(
     selected_thinking_level: str,
 ) -> None:
     st.subheader("AI相談")
-    repository = get_repository()
     today = current_time().date()
     today_summary = summarize_today_logs(logs, today)
     trend_summary = summarize_recent_progress(logs, lookback_days=14)
-    recent_advice = repository.load_advice_history(days=2)
+    recent_advice = repository_read(
+        lambda repository: repository.load_advice_history(days=2),
+        fallback=[],
+    )
     profile = load_profile_settings()
 
     left, right = st.columns([1, 1])
@@ -634,6 +752,31 @@ def render_advice_tab(
             st.success("目標・備考を保存しました。")
             st.rerun()
 
+    planned_minutes = st.number_input(
+        "今日のジム予定滞在時間(分)",
+        min_value=1,
+        value=int(st.session_state.get("advice_planned_minutes", 25)),
+        step=1,
+        key="advice_planned_minutes",
+        on_change=mark_planned_minutes_updated,
+        help="デフォルトは25分です。",
+    )
+    planned_set_at = st.session_state.get("advice_planned_minutes_set_at", current_time().isoformat(timespec="seconds"))
+    try:
+        planned_set_at_dt = datetime.fromisoformat(planned_set_at)
+    except ValueError:
+        planned_set_at_dt = current_time()
+        planned_set_at = planned_set_at_dt.isoformat(timespec="seconds")
+        st.session_state["advice_planned_minutes_set_at"] = planned_set_at
+    elapsed_minutes = max(
+        0,
+        int((current_time() - planned_set_at_dt).total_seconds() // 60),
+    )
+    remaining_minutes = max(0, int(planned_minutes) - elapsed_minutes)
+    st.caption(
+        f"予定滞在時間の入力時刻: {planned_set_at} / 相談時点の推定残り時間: {remaining_minutes} 分"
+    )
+
     question = st.text_area(
         "相談内容",
         key="advice_question",
@@ -657,6 +800,9 @@ def render_advice_tab(
                 now=current_time(),
                 goal_text=profile["goal"],
                 note_text=profile["note"],
+                planned_stay_minutes=int(planned_minutes),
+                planned_stay_recorded_at=planned_set_at,
+                remaining_minutes=remaining_minutes,
                 today_summary=today_summary,
                 trend_summary=trend_summary,
                 recent_logs=logs,
@@ -671,19 +817,24 @@ def render_advice_tab(
             st.error(f"アドバイス生成に失敗しました: {exc}")
         else:
             executed_at = current_time().isoformat(timespec="seconds")
-            repository.append_advice_history(
-                {
-                    "実行日時": executed_at,
-                    "相談内容": question.strip(),
-                    "回答": "\n".join([advice["summary"], *advice["advice"]]).strip(),
-                    "回答JSON": json_dumps(advice["_raw"]),
-                    "今日のメニュー": today_summary,
-                    "参照開始日": min((row["日付"] for row in logs), default=today.isoformat()),
-                    "参照終了日": max((row["日付"] for row in logs), default=today.isoformat()),
-                    "参照ログ件数": len(logs),
-                    "モデル": f"{selected_model} ({selected_thinking_level})",
-                }
+            saved = repository_write(
+                lambda repository: repository.append_advice_history(
+                    {
+                        "実行日時": executed_at,
+                        "相談内容": question.strip(),
+                        "回答": "\n".join([advice["summary"], *advice["advice"]]).strip(),
+                        "回答JSON": json_dumps(advice["_raw"]),
+                        "今日のメニュー": today_summary,
+                        "参照開始日": min((row["日付"] for row in logs), default=today.isoformat()),
+                        "参照終了日": max((row["日付"] for row in logs), default=today.isoformat()),
+                        "参照ログ件数": len(logs),
+                        "モデル": f"{selected_model} ({selected_thinking_level})",
+                    }
+                )
             )
+            if not saved:
+                st.error("相談履歴の保存に失敗しました。スプレッドシート接続を確認してください。")
+                return
             st.session_state["last_advice"] = advice
             st.success("アドバイスを保存しました。")
             st.rerun()
@@ -704,13 +855,14 @@ def main() -> None:
     require_login()
     ensure_session_state()
     selected_model, selected_thinking_level = render_sidebar()
-    try:
-        repository = get_repository()
-        recent_logs = repository.load_logs(days=14)
-        all_logs = repository.load_logs(days=None)
-    except Exception:
-        st.error("Google スプレッドシートに接続できません。共有権限または secrets の設定を確認してください。")
-        st.stop()
+    recent_logs = repository_read(
+        lambda repository: repository.load_logs(days=14),
+        fallback=[],
+    )
+    all_logs = repository_read(
+        lambda repository: repository.load_logs(days=None),
+        fallback=[],
+    )
 
     st.title("筋トレログアプリ")
     st.caption("手入力、自然言語入力、LLMアドバイス、Google Sheets 保存をまとめた Streamlit アプリです。")

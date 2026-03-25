@@ -119,6 +119,9 @@ class GeminiClient:
         now: datetime,
         goal_text: str,
         note_text: str,
+        planned_stay_minutes: int,
+        planned_stay_recorded_at: str,
+        remaining_minutes: int,
         today_summary: str,
         trend_summary: str,
         recent_logs: list[dict[str, Any]],
@@ -131,6 +134,18 @@ class GeminiClient:
 回答は必ず JSON のみで返してください。
 
 現在日時: {now.isoformat(timespec="seconds")}
+相談実行時刻:
+{now.isoformat(timespec="seconds")}
+
+今日のジム予定滞在時間(分):
+{planned_stay_minutes}
+
+予定滞在時間の入力時刻:
+{planned_stay_recorded_at}
+
+相談時点の推定残り時間(分):
+{remaining_minutes}
+
 目標:
 {goal_text.strip()}
 
